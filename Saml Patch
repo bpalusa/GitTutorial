@@ -1,0 +1,146 @@
+Patch URL:  https://www.drupal.org/files/issues/2894327-reevaluate_roles-14.patch
+
+
+diff --git a/simplesamlphp_auth.install b/simplesamlphp_auth.install
+index aebd9dc..12f5aa5 100644
+--- a/simplesamlphp_auth.install
++++ b/simplesamlphp_auth.install
+@@ -5,6 +5,7 @@
+  * The install file for the simplesamlphp_auth module.
+  */
+ 
++use Drupal\Core\Url;
+ use Drupal\Core\Session\AccountInterface;
+ use Drupal\Core\Site\Settings;
+ 
+@@ -23,7 +24,7 @@ function simplesamlphp_auth_install() {
+   $user_settings->save();
+   // Inform the user about disabling the open registration.
+   drupal_set_message(t('The SimpleSAMLphp Authentication module disabled the user registration. You can manually enable it again in the <a href=":user_settings_url">Account settings</a>.', [
+-    ':user_settings_url' => \Drupal\Core\Url::fromRoute('entity.user.admin_form')->toString()
++    ':user_settings_url' => Url::fromRoute('entity.user.admin_form')->toString(),
+   ]), 'warning');
+   $config->save();
+ }
+@@ -96,3 +97,12 @@ function simplesamlphp_auth_update_8001() {
+ function simplesamlphp_auth_update_8002() {
+   \Drupal::service('router.builder')->rebuild();
+ }
++
++/**
++ * "Reevaluate roles every time the user logs" will now remove roles if selected.
++ *
++ * See changelog at https://www.drupal.org/node/2939077.
++ * This update hook is empty and for messaging purposes only.
++ */
++function simplesamlphp_auth_update_8003() {
++}
+diff --git a/src/Service/SimplesamlphpDrupalAuth.php b/src/Service/SimplesamlphpDrupalAuth.php
+index 4eaef22..aeb4151 100644
+--- a/src/Service/SimplesamlphpDrupalAuth.php
++++ b/src/Service/SimplesamlphpDrupalAuth.php
+@@ -4,10 +4,11 @@ namespace Drupal\simplesamlphp_auth\Service;
+ 
+ use Drupal\Core\Config\ConfigFactoryInterface;
+ use Drupal\Core\Entity\EntityTypeManagerInterface;
+-use Drupal\user\UserInterface;
+ use Drupal\Core\Session\AccountInterface;
+-use Psr\Log\LoggerInterface;
+ use Drupal\externalauth\ExternalAuthInterface;
++use Drupal\user\Entity\User;
++use Drupal\user\UserInterface;
++use Psr\Log\LoggerInterface;
+ 
+ /**
+  * Service to link SimpleSAMLphp authentication with Drupal users.
+@@ -61,15 +62,15 @@ class SimplesamlphpDrupalAuth {
+    *
+    * @param SimplesamlphpAuthManager $simplesaml_auth
+    *   The SimpleSAML Authentication helper service.
+-   * @param ConfigFactoryInterface $config_factory
++   * @param \Drupal\Core\Config\ConfigFactoryInterface $config_factory
+    *   The configuration factory.
+    * @param \Drupal\Core\Entity\EntityTypeManagerInterface $entity_type_manager
+    *   The entity type manager.
+-   * @param LoggerInterface $logger
++   * @param \Psr\Log\LoggerInterface $logger
+    *   A logger instance.
+-   * @param ExternalAuthInterface $externalauth
++   * @param \Drupal\externalauth\ExternalAuthInterface $externalauth
+    *   The ExternalAuth service.
+-   * @param AccountInterface $account
++   * @param \Drupal\Core\Session\AccountInterface $account
+    *   The currently logged in user.
+    */
+   public function __construct(SimplesamlphpAuthManager $simplesaml_auth, ConfigFactoryInterface $config_factory, EntityTypeManagerInterface $entity_type_manager, LoggerInterface $logger, ExternalAuthInterface $externalauth, AccountInterface $account) {
+@@ -79,6 +80,7 @@ class SimplesamlphpDrupalAuth {
+     $this->logger = $logger;
+     $this->externalauth = $externalauth;
+     $this->currentUser = $account;
++
+   }
+ 
+   /**
+@@ -257,25 +259,47 @@ class SimplesamlphpDrupalAuth {
+   /**
+    * Adds roles to user accounts.
+    *
+-   * @param UserInterface $account
++   * @param \Drupal\user\Entity\UserInterface $account
+    *   The Drupal user to add roles to.
+    */
+   public function roleMatchAdd(UserInterface $account) {
++
++    // Load user entity so we have access to the full user interface.
++    /** @var Drupal\user\Entity\User $user */
++    $user = User::load($account->id());
+     // Get matching roles based on retrieved SimpleSAMLphp attributes.
+     $matching_roles = $this->getMatchingRoles();
++    // Get user's current roles, excluding locked roles (e.g. Authenticated).
++    $current_roles = $user->getRoles(TRUE);
++
++    // Remove non-locked roles not mapped to the user via SAML.
++    foreach ($current_roles as $role_id) {
++      if (!in_array($role_id, $matching_roles)) {
++        if ($this->config->get('debug')) {
++          $this->logger->debug('Removing role %role from user %name', [
++            '%role' => $role_id,
++            '%name' => $user->getAccountName(),
++          ]);
++        }
++        $user->removeRole($role_id);
++      }
++    }
+ 
++    // Add roles mapped to the user via SAML.
+     if ($matching_roles) {
+       foreach ($matching_roles as $role_id) {
+         if ($this->config->get('debug')) {
+           $this->logger->debug('Adding role %role to user %name', [
+             '%role' => $role_id,
+-            '%name' => $account->getAccountName(),
++            '%name' => $user->getAccountName(),
+           ]);
+         }
+-        $account->addRole($role_id);
++        $user->addRole($role_id);
+       }
+-      $account->save();
+     }
++
++    // Save the user.
++    $user->save();
+   }
+ 
+   /**
+@@ -351,7 +375,7 @@ class SimplesamlphpDrupalAuth {
+         return ($after == $value);
+ 
+       case '~=':
+-        return array_filter($attribute, function($subattr) use ($value) {
++        return array_filter($attribute, function ($subattr) use ($value) {
+           return strpos($subattr, $value) !== FALSE;
+         });
+     }
+
+
